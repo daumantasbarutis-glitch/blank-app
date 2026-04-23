@@ -3,97 +3,116 @@ import pandas as pd
 import plotly.express as px
 import requests
 from datetime import datetime, timedelta
+import pytz
 
-# --- KONFIGURACIJA ---
-st.set_page_config(page_title="BLYKSNIS ULTRA", layout="wide")
-MOKESCIAI, MARZA, PVM = 0.11106, 0.005, 1.21
+# --- NUSTATYMAI ---
+st.set_page_config(page_title="BLYKSNIS: Energetinis Skydas", page_icon="⚡", layout="wide")
 
+# --- DUOMENŲ GAVIMAS (Nord Pool LT per Elering API) ---
 @st.cache_data(ttl=3600)
-def get_prices(start_dt, end_dt):
+def gauti_kainas():
+    tz = pytz.timezone('Europe/Vilnius')
+    dabar = datetime.now(tz)
+    pradzia = (dabar - timedelta(days=1)).strftime('%Y-%m-%dT22:00:00.000Z')
+    pabaiga = (dabar + timedelta(days=2)).strftime('%Y-%m-%dT22:00:00.000Z')
+    
+    url = f"https://dashboard.elering.ee/api/nps/price/LT?start={pradzia}&end={pabaiga}"
     try:
-        url = f"https://dashboard.elering.ee/api/nps/price?start={start_dt.strftime('%Y-%m-%dT21:00:00Z')}&end={end_dt.strftime('%Y-%m-%dT23:00:00Z')}"
-        res = requests.get(url, timeout=10).json()
-        df = pd.DataFrame(res['data']['lt'])
-        # Laiko fiksas zonų suderinimui
-        df['Laikas'] = pd.to_datetime(df['timestamp'], unit='s') + timedelta(hours=2)
-        df['Laikas'] = df['Laikas'].dt.tz_localize(None)
-        df['Tik Biržos kaina'] = df['price'] / 1000
-        df['Kaina su mokesčiais ir PVM'] = (df['Tik Biržos kaina'] + MARZA + MOKESCIAI) * PVM
-        return df
-    except Exception:
-        return None
+        r = requests.get(url)
+        duomenys = r.json()
+        df = pd.DataFrame(duomenys['data']['lt'])
+        df['data_laikas'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert('Europe/Vilnius')
+        df['kaina_mwh'] = df['price']
+        return df[['data_laikas', 'kaina_mwh']]
+    except:
+        st.error("⚠️ Nepavyko gauti biržos duomenų. Patikrinkite interneto ryšį.")
+        return pd.DataFrame()
 
-st.title("⚡ BLYKSNIS: Energijos Valdymo Skydas")
+# --- UI (Vartotojo sąsaja) ---
+st.title("⚡ BLYKSNIS: Energetinis Skydas")
+st.markdown("Tavo asmeninis elektros kainų, saulės generacijos ir išmaniųjų namų valdymo centras.")
 
-# 1. KAINŲ GRAFIKAS
-now = datetime.now().replace(minute=0, second=0, microsecond=0)
-prices_df = get_prices(now - timedelta(days=1), now + timedelta(days=2))
+# --- ŠONINĖ JUOSTA (Nustatymai) ---
+st.sidebar.header("⚙️ Tavo Nustatymai")
+pvm = st.sidebar.selectbox("PVM Tarifas (%)", [21, 9, 0], index=0)
+marza = st.sidebar.number_input("Tiekėjo marža (ct/kWh)", value=1.0, step=0.1)
+eso_tarifas = st.sidebar.number_input("ESO persiuntimas (ct/kWh)", value=8.5, step=0.1)
 
-if prices_df is not None:
-    st.sidebar.header("🕹️ Valdymo skydas")
-    duration = st.sidebar.slider("Veikimo trukmė (val.):", 1, 12, 3)
-    df_f = prices_df[prices_df['Laikas'] >= now].copy()
-    valid_starts = df_f['Laikas'].tolist()[:-duration] if len(df_f) > duration else df_f['Laikas'].tolist()
+# Skaičiavimai
+df = gauti_kainas()
 
-    if valid_starts:
-        chosen_start = st.sidebar.select_slider("Slinkite laiką:", options=valid_starts, format_func=lambda x: x.strftime("%m-%d %H:%M"))
-        chosen_end = chosen_start + timedelta(hours=duration)
-        mask = (prices_df['Laikas'] >= chosen_start) & (prices_df['Laikas'] < chosen_end)
-        avg_p = prices_df.loc[mask, 'Kaina su mokesčiais ir PVM'].mean()
+if not df.empty:
+    # Apskaičiuojam galutinę kainą (ct/kWh)
+    df['kaina_ct_kwh'] = df['kaina_mwh'] / 10 
+    df['galutine_kaina'] = (df['kaina_ct_kwh'] + marza + eso_tarifas) * (1 + pvm/100)
+    
+    tz = pytz.timezone('Europe/Vilnius')
+    dabar = datetime.now(tz)
+    # Filtruojame tik tas valandas, kurios yra dabar arba ateityje
+    df_ateitis = df[df['data_laikas'] >= dabar.replace(minute=0, second=0, microsecond=0)].copy()
 
-        c1, c2 = st.columns(2)
-        c1.metric("Pasirinktas langas", f"{chosen_start.strftime('%H:%M')} - {chosen_end.strftime('%H:%M')}")
-        c2.metric("Vidutinė kaina", f"{avg_p:.3f} €/kWh")
+    # --- TABAI (Puslapiai) ---
+    tab1, tab2, tab3 = st.tabs(["📊 Biržos Radaras", "🚗 EV & Prietaisai", "☀️ Saulės Generacija"])
 
-        # Dvigubas grafikas (Birža vs Galutinė)
-        df_plot = prices_df[(prices_df['Laikas'] >= now - timedelta(hours=6)) & (prices_df['Laikas'] <= now + timedelta(hours=24))].melt(
-            id_vars=['Laikas'], value_vars=['Tik Biržos kaina', 'Kaina su mokesčiais ir PVM'], var_name='Tipas', value_name='€'
-        )
-        fig = px.line(df_plot, x='Laikas', y='€', color='Tipas', color_discrete_map={'Tik Biržos kaina': '#3498db', 'Kaina su mokesčiais ir PVM': '#f1c40f'})
-        fig.add_vrect(x0=chosen_start, x1=chosen_end, fillcolor="green", opacity=0.3)
-        st.plotly_chart(fig, use_container_width=True)
-
-# 2. ESO SKAIČIUOKLĖ SU 40% OPTIMIZACIJA
-st.divider()
-st.subheader("📊 ESO Analitika: Kiek galėjote sutaupyti?")
-file = st.file_uploader("Įkelkite ESO CSV failą", type="csv")
-
-if file:
-    try:
-        # Lankstus CSV skaitymas
-        try: eso = pd.read_csv(file, sep=';', decimal=',', encoding='utf-8')
-        except: eso = pd.read_csv(file, sep=',', decimal='.', encoding='utf-8')
+    # 1. BIRŽOS RADARAS
+    with tab1:
+        st.subheader("Elektros Kaina (Įskaičiavus ESO, Maržą ir PVM)")
         
-        t_col = [c for c in eso.columns if 'data' in c.lower() or 'valand' in c.lower()][0]
-        q_col = [c for c in eso.columns if 'kiekis' in c.lower() or 'kwh' in c.lower()][0]
-
-        # Laiko suvienodinimas be zonų
-        eso['Laikas'] = pd.to_datetime(eso[t_col], format='ISO8601', utc=True).dt.tz_convert('Europe/Vilnius').dt.tz_localize(None).dt.floor('h')
-        eso[q_col] = pd.to_numeric(eso[q_col].astype(str).str.replace(',', '.'), errors='coerce')
-        
-        hist_p = get_prices(eso['Laikas'].min() - timedelta(days=1), eso['Laikas'].max() + timedelta(days=1))
-        
-        if hist_p is not None:
-            m = pd.merge(eso, hist_p[['Laikas', 'Kaina su mokesčiais ir PVM']], on='Laikas')
-            m['Eur_F'] = m[q_col] * m['Kaina su mokesčiais ir PVM']
+        # Pagrindiniai rodikliai
+        if not df_ateitis.empty:
+            dabartine_kaina = df_ateitis.iloc[0]['galutine_kaina']
+            pigiausia = df_ateitis['galutine_kaina'].min()
+            brangiausia = df_ateitis['galutine_kaina'].max()
             
-            faktas = m['Eur_F'].sum()
-            viso_kwh = m[q_col].sum()
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Dabartinė kaina", f"{dabartine_kaina:.2f} ct")
+            col2.metric("Pigiausia paros", f"{pigiausia:.2f} ct")
+            col3.metric("Brangiausia paros", f"{brangiausia:.2f} ct")
 
-            if faktas > 0:
-                # 40% perkėlimo logika (Super skaičiuoklė)
-                p_kiekis = viso_kwh * 0.40
-                # Pigiausių 20% valandų vidurkis optimizacijai
-                v_pigiausia = m.sort_values('Kaina su mokesčiais ir PVM').head(int(len(m)*0.2))['Kaina su mokesčiais ir PVM'].mean()
-                teorine = (faktas * 0.60) + (p_kiekis * v_pigiausia)
-                skirtumas = faktas - teorine
+            # Grafikas
+            fig = px.bar(df_ateitis, x='data_laikas', y='galutine_kaina', 
+                         labels={'data_laikas': 'Laikas', 'galutine_kaina': 'Kaina (ct/kWh)'},
+                         color='galutine_kaina', color_continuous_scale='RdYlGn_r',
+                         text_auto='.1f')
+            fig.update_layout(xaxis_title="", yaxis_title="ct / kWh", showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
 
-                st.success(f"✅ Apdorota {viso_kwh:.1f} kWh duomenų.")
-                ca, cb, cc = st.columns(3)
-                ca.metric("Sumokėta", f"{faktas:.2f} €")
-                cb.metric("Su 40% optimizacija", f"{teorine:.2f} €", delta=f"-{skirtumas:.2f} €")
-                cc.metric("Sutaupymas", f"{(skirtumas/faktas*100):.1f} %")
-                
-                st.write(f"💡 Perkėlus 40% suvartojimo į pigiausias valandas, sutaupytumėte **{skirtumas:.2f} €**.")
-    except Exception as e:
-        st.error(f"Klaida apdorojant failą: {e}")
+    # 2. ĮRENGINIŲ VALDYMAS
+    with tab2:
+        st.subheader("🎯 Auksinio Lango Paieška")
+        st.write("Nurodyk, kiek valandų iš eilės reikia tavo elektromobiliui, šilumos siurbliui ar boileriui:")
+        trukmė = st.slider("Reikalingas valandų kiekis", 1, 8, 3)
+        
+        # Algoritmas ieško pigiausio bloko
+        df_ateitis['slenkantis_vidurkis'] = df_ateitis['galutine_kaina'].rolling(window=trukmė).mean()
+        geriausias_pabaiga = df_ateitis.loc[df_ateitis['slenkantis_vidurkis'].idxmin()]
+        
+        if pd.notna(geriausias_pabaiga['slenkantis_vidurkis']):
+            laikas_pabaiga = geriausias_pabaiga['data_laikas']
+            laikas_pradzia = laikas_pabaiga - timedelta(hours=trukmė-1)
+            
+            st.success(f"✅ Pigiausias laikas jungti: nuo **{laikas_pradzia.strftime('%H:%M')}** iki **{(laikas_pabaiga + timedelta(hours=1)).strftime('%H:%M')}**")
+            st.info(f"Vidutinė kaina šiuo periodu: **{geriausias_pabaiga['slenkantis_vidurkis']:.2f} ct/kWh**")
+        
+        st.divider()
+        st.subheader("🎛️ Prietaisų Valdymo Pultas")
+        st.caption("Čia bus prijungti tavo namų įrenginių API (Tuya, ESP, Tesla ir kt.)")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.button("🟢 Įjungti Šildymą / Boilerį", use_container_width=True)
+            st.button("🔴 Išjungti Šildymą / Boilerį", use_container_width=True)
+        with col_b:
+            st.button("⚡ Pradėti EV Krovimą", use_container_width=True)
+            st.button("⏸️ Stabdyti EV Krovimą", use_container_width=True)
+
+    # 3. SAULĖS PARKAS
+    with tab3:
+        st.subheader("☀️ Nutolęs Saulės Parkas (Kreditų skaičiuoklė)")
+        galia = st.number_input("Tavo elektrinės galia (kW)", min_value=1.0, value=10.0, step=0.5)
+        st.write("Prognozuojama dienos generacija:")
+        
+        # Simuliacija (vėliau jungsime Forecast.Solar API)
+        prognoze = galia * 4.2 
+        st.info(f"Šiandien turėtum sugeneruoti apie **{prognoze:.1f} kWh**.")
+        st.progress(70, text="Dienos planas įvykdytas 70%")
+        st.write("💡 *Patarimas: Šiuo metu biržos kaina krenta, verta naudoti sukauptus kreditus.*")
